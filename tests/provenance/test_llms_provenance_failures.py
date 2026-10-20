@@ -144,3 +144,25 @@ def test_litellm_client_failure_reaches_audit_log(monkeypatch, method):
     entries = wrapper._prov_manager.audit_log(format="json")
     assert len(entries) == 1
     assert entries[0]["metadata"]["error"] == "ProcessingError"
+
+
+@pytest.mark.parametrize("wrapper_name, target, sampling", WRAPPERS)
+@pytest.mark.parametrize("fails", [True, False])
+def test_per_call_model_override_is_recorded(
+    monkeypatch, wrapper_name, target, sampling, fails
+):
+    llm = Mock(model="test-model")
+    llm.generate.side_effect = [ValueError("boom") if fails else "answer", "answer"]
+    monkeypatch.setattr(target, Mock(return_value=llm))
+    wrapper = getattr(wrappers, wrapper_name)(provenance=True)
+
+    if fails:
+        with pytest.raises(ValueError):
+            wrapper.generate("question", model="override-model")
+    else:
+        wrapper.generate("question", model="override-model")
+    wrapper.generate("question")
+
+    first, second = wrapper._prov_manager.audit_log(format="json")
+    assert first["metadata"]["model"] == "override-model"
+    assert second["metadata"]["model"] == "test-model"
