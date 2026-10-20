@@ -157,13 +157,16 @@ class LiteLLM:
         try:
             # Merge config with kwargs
             options = {**self.config, **kwargs}
+            # A per-call model= overrides the constructor model; leaving it in
+            # options would pass model to completion() twice.
+            model = options.pop("model", None) or self.model
             
             # Prepare messages
             messages = [{"role": "user", "content": prompt}]
             
             # Call LiteLLM completion
             response = completion(
-                model=self.model,
+                model=model,
                 messages=messages,
                 api_key=self.api_key,
                 **options
@@ -229,13 +232,16 @@ class LiteLLM:
             
             # Merge config with kwargs
             options = {**self.config, **kwargs}
+            # A per-call model= overrides the constructor model; leaving it in
+            # options would pass model to completion() twice.
+            model = options.pop("model", None) or self.model
             
             # Prepare messages
             messages = [{"role": "user", "content": json_prompt}]
             
             # Call LiteLLM completion
             response = completion(
-                model=self.model,
+                model=model,
                 messages=messages,
                 api_key=self.api_key,
                 **options
@@ -301,6 +307,9 @@ class LiteLLM:
             )
 
         options = {**self.config, **kwargs}
+        # A per-call model= overrides the constructor model; leaving it in
+        # options would pass model to completion() twice.
+        model = options.pop("model", None) or self.model
 
         # Preferred path: instructor drives the schema and retries natively.
         # Only an instructor setup failure falls through to the manual loop - a
@@ -319,7 +328,7 @@ class LiteLLM:
             if client is not None:
                 try:
                     return client.chat.completions.create(
-                        model=self.model,
+                        model=model,
                         messages=[{"role": "user", "content": prompt}],
                         api_key=self.api_key,
                         response_model=schema,
