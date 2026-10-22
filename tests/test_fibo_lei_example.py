@@ -152,7 +152,10 @@ def test_missing_status_axiom_stops_derivation():
     graph = run.rdflib.Graph().parse(run.SLICE_PATH, format="turtle")
     entry = run.BREG.LegalEntityIdentifierRegistryEntry
     prop = run.BREG.hasRegistrationStatus
-    bounds = run.constraint_from_axioms(graph, entry, prop, {"min", "max"})
+    # Use the bounds FROM_AXIOMS really asks for, so weakening that row fails here.
+    (expects,) = [e for cls, p, e in run.FROM_AXIOMS if cls == entry and p == prop]
+    assert "min" in expects
+    bounds = run.constraint_from_axioms(graph, entry, prop, expects)
     assert bounds[:2] == (1, 1)
 
     # Drop the entry's own someValuesFrom axiom; the inherited max 1 remains.
@@ -161,4 +164,28 @@ def test_missing_status_axiom_stops_derivation():
             graph.remove((entry, run.RDFS.subClassOf, r))
 
     with pytest.raises(ValueError, match="no axiom giving a min cardinality"):
-        run.constraint_from_axioms(graph, entry, prop, {"min", "max"})
+        run.constraint_from_axioms(graph, entry, prop, expects)
+
+
+def test_subclass_declared_in_the_slice_counts_but_not_one_in_the_record():
+    spec = importlib.util.spec_from_file_location("fibo_lei_run", RUN)
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    slice_graph = run.rdflib.Graph().parse(run.SLICE_PATH, format="turtle")
+    record = run.rdflib.Graph().parse(
+        RUN.parent / "records" / "HWUPKR0MPOU8FGXBT394.ttl", format="turtle"
+    )
+    assert run.missing_types(record, slice_graph) == []
+
+    sub = run.URIRef("https://example.org/test#SpecialEntity")
+    for s in list(record.subjects(run.RDF.type, run.LEI.LEIRegisteredEntity)):
+        record.remove((s, run.RDF.type, run.LEI.LEIRegisteredEntity))
+        record.add((s, run.RDF.type, sub))
+    # Declared only in the record: not accepted.
+    record.add((sub, run.RDFS.subClassOf, run.LEI.LEIRegisteredEntity))
+    assert run.missing_types(record, slice_graph) == [
+        "no LEIRegisteredEntity in record"
+    ]
+    # Declared in the slice: accepted, as sh:targetClass would.
+    slice_graph.add((sub, run.RDFS.subClassOf, run.LEI.LEIRegisteredEntity))
+    assert run.missing_types(record, slice_graph) == []

@@ -117,8 +117,8 @@ legal entities in that sense (sole traders, for example). The jurisdiction axiom
 stated on `cmns-org:LegalEntity`, so the jurisdiction checks apply only to records
 typed that way. All five records here are organizations formed under a
 jurisdiction, so they carry the type. A record without it is not checked for
-jurisdiction at all. It must still type its entity as `LEIRegisteredEntity`; only
-the `cmns-org:LegalEntity` type is optional.
+jurisdiction at all. It must still type its entity as `LEIRegisteredEntity` (or a
+subclass the slice declares); only the `cmns-org:LegalEntity` type is optional.
 
 Limits worth knowing:
 

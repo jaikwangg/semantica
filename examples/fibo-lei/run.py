@@ -265,13 +265,18 @@ def count_property_shapes(shapes):
     return len(list(graph.objects(None, SH.property)))
 
 
-def missing_types(record):
-    """Return a message for each REQUIRED_TYPES class with no instance in the record."""
-    return [
-        f"no {local_name(cls)} in record"
-        for cls in REQUIRED_TYPES
-        if next(record.subjects(RDF.type, cls), None) is None
-    ]
+def missing_types(record, slice_graph):
+    """Return a message for each REQUIRED_TYPES class with no instance in the record.
+
+    An instance of a subclass counts, as it does for sh:targetClass, but only
+    subclasses the slice declares: the record cannot add its own class axioms.
+    """
+    missing = []
+    for cls in REQUIRED_TYPES:
+        accepted = set(slice_graph.transitive_subjects(RDFS.subClassOf, cls))
+        if not any(next(record.subjects(RDF.type, c), None) for c in accepted):
+            missing.append(f"no {local_name(cls)} in record")
+    return missing
 
 
 def check_record(slice_graph, shapes, record):
@@ -285,7 +290,7 @@ def check_record(slice_graph, shapes, record):
     data = record + slice_graph  # class hierarchy and status individuals for sh:class
     report = run_shacl_validation(data.serialize(format="turtle"), shapes)
     report.explain_violations()
-    return name, report, missing_types(record)
+    return name, report, missing_types(record, slice_graph)
 
 
 def main(argv=None):
