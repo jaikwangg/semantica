@@ -177,7 +177,7 @@ valid FIBO registration status and so passes.
   The Turtle conversion was made for this example; it is not provided, endorsed, or
   supported by GLEIF. The [CC0 1.0 deed](https://creativecommons.org/publicdomain/zero/1.0/)
   asks that uses of the work not imply endorsement by the author or affirmer, and
-  section IV(c) of the GLEIF terms asks the same for anything beyond the original
+  section IV.2 of the GLEIF terms asks the same for anything beyond the original
   LEI data.
 - `run.py` and this README are part of Semantica and fall under the repository's
   license.
