@@ -339,3 +339,37 @@ def test_generate_typed_per_call_model_reaches_instructor(litellm_available, mon
 
     _, kwargs = fake_client.chat.completions.create.call_args
     assert kwargs["model"] == "openai/gpt-4o-mini"
+
+
+@pytest.mark.parametrize("method", ["generate", "generate_structured"])
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n", None, 123])
+def test_blank_per_call_model_falls_back_to_constructor_model(
+    litellm_available, monkeypatch, method, blank
+):
+    # Same rule as _track_llm_call: a value that names no model is not sent.
+    fake_message = MagicMock()
+    fake_message.content = '{"ok": 1}'
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=fake_message)]
+    completion = MagicMock(return_value=fake_response)
+    monkeypatch.setattr(litellm_module, "completion", completion)
+
+    llm = LiteLLM(model="openai/gpt-4o", api_key="k")
+    getattr(llm, method)("hello", model=blank)
+
+    assert completion.call_args.kwargs["model"] == "openai/gpt-4o"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_generate_typed_blank_per_call_model_falls_back(
+    litellm_available, monkeypatch, blank
+):
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _Point(x=1, y=2)
+    _with_instructor(monkeypatch, fake_client)
+
+    llm = LiteLLM(model="openai/gpt-4o", api_key="k")
+    llm.generate_typed("give me a point", _Point, model=blank)
+
+    _, kwargs = fake_client.chat.completions.create.call_args
+    assert kwargs["model"] == "openai/gpt-4o"

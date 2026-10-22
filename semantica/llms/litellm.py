@@ -131,6 +131,21 @@ class LiteLLM:
         self.api_key = api_key
         self.config = kwargs
 
+    def _resolve_model(self, options: Dict[str, Any]) -> str:
+        """Pop a per-call ``model`` from ``options`` and return the model to use.
+
+        The per-call value is removed so ``completion()`` does not receive
+        ``model`` twice. It wins only when it is a string that names a model
+        (its ``strip()`` is not empty); anything else - absent, ``None``, empty,
+        whitespace-only or not a string - falls back to ``self.model``. This is
+        the rule ``_track_llm_call`` uses to record the model, so a provenance
+        entry names the model that was actually sent.
+        """
+        model = options.pop("model", None)
+        if isinstance(model, str) and model.strip():
+            return model
+        return self.model
+
     def is_available(self) -> bool:
         """Check if LiteLLM provider is available."""
         return LITELLM_AVAILABLE
@@ -157,9 +172,7 @@ class LiteLLM:
         try:
             # Merge config with kwargs
             options = {**self.config, **kwargs}
-            # A per-call model= overrides the constructor model; leaving it in
-            # options would pass model to completion() twice.
-            model = options.pop("model", None) or self.model
+            model = self._resolve_model(options)
             
             # Prepare messages
             messages = [{"role": "user", "content": prompt}]
@@ -232,9 +245,7 @@ class LiteLLM:
             
             # Merge config with kwargs
             options = {**self.config, **kwargs}
-            # A per-call model= overrides the constructor model; leaving it in
-            # options would pass model to completion() twice.
-            model = options.pop("model", None) or self.model
+            model = self._resolve_model(options)
             
             # Prepare messages
             messages = [{"role": "user", "content": json_prompt}]
@@ -307,9 +318,7 @@ class LiteLLM:
             )
 
         options = {**self.config, **kwargs}
-        # A per-call model= overrides the constructor model; leaving it in
-        # options would pass model to completion() twice.
-        model = options.pop("model", None) or self.model
+        model = self._resolve_model(options)
 
         # Preferred path: instructor drives the schema and retries natively.
         # Only an instructor setup failure falls through to the manual loop - a
