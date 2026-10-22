@@ -55,21 +55,27 @@ CMNS_RGA = rdflib.Namespace("https://www.omg.org/spec/Commons/RegulatoryAgencies
 SH = rdflib.Namespace("http://www.w3.org/ns/shacl#")
 
 # Shapes whose cardinality and sh:class are read from an OWL restriction in the
-# slice. The comment names the axiom; derive_shapes() fails if it is missing.
+# slice. The comment names the axiom, and the last item names the bounds those
+# axioms must give: derive_shapes() fails if one is missing, so dropping an axiom
+# from the slice cannot silently weaken a shape.
 FROM_AXIOMS = [
     # LEIRegisteredEntity == isIdentifiedBy some LegalEntityIdentifier
-    (LEI.LEIRegisteredEntity, CMNS_ID.isIdentifiedBy),
+    (LEI.LEIRegisteredEntity, CMNS_ID.isIdentifiedBy, {"min"}),
     # LegalEntity subClassOf isOrganizedIn exactly 1 Jurisdiction
-    (CMNS_ORG.LegalEntity, CMNS_RGA.isOrganizedIn),
+    (CMNS_ORG.LegalEntity, CMNS_RGA.isOrganizedIn, {"min", "max"}),
     # LegalEntityIdentifier subClassOf identifies exactly 1 LegalPerson
-    (LEI.LegalEntityIdentifier, CMNS_ID.identifies),
+    (LEI.LegalEntityIdentifier, CMNS_ID.identifies, {"min", "max"}),
     # LegalEntityIdentifier subClassOf isDefinedIn some LegalEntityIdentifierScheme
-    (LEI.LegalEntityIdentifier, CMNS_DSG.isDefinedIn),
+    (LEI.LegalEntityIdentifier, CMNS_DSG.isDefinedIn, {"min"}),
     # LEI registry entry subClassOf hasRegistrationStatus some RegistrationStatus,
     # and (via BusinessRegistryEntry) max 1 RegistrationStatus
-    (BREG.LegalEntityIdentifierRegistryEntry, BREG.hasRegistrationStatus),
+    (
+        BREG.LegalEntityIdentifierRegistryEntry,
+        BREG.hasRegistrationStatus,
+        {"min", "max"},
+    ),
     # LEI registry entry subClassOf comprises some LegalEntityIdentifier
-    (BREG.LegalEntityIdentifierRegistryEntry, CMNS_COL.comprises),
+    (BREG.LegalEntityIdentifierRegistryEntry, CMNS_COL.comprises, {"min"}),
 ]
 
 # Value constraints FIBO does not state as OWL axioms but takes from the
@@ -101,6 +107,11 @@ REGISTRY_ENTRY_SHAPE = f"""
     ] .
 """
 
+# The classes a record must contain an instance of. Every generated shape
+# targets a class, so a record with no LEI or no LEI-registered entity has no
+# focus nodes for those shapes and would otherwise conform vacuously.
+REQUIRED_TYPES = [LEI.LegalEntityIdentifier, LEI.LEIRegisteredEntity]
+
 
 def local_name(iri):
     """Return the last path segment of an IRI (FIBO IRIs end in a term name)."""
@@ -123,14 +134,18 @@ def restrictions_on(graph, cls):
                     yield graph.value(target, OWL.onProperty), target
 
 
-def constraint_from_axioms(graph, cls, prop):
-    """Read (minCount, maxCount, sh:class) from the OWL restrictions on cls for prop."""
+def constraint_from_axioms(graph, cls, prop, expects=("min",)):
+    """Read (minCount, maxCount, sh:class) from the OWL restrictions on cls for prop.
+
+    The minimum comes only from someValuesFrom, min and exact restrictions and
+    the maximum only from max and exact ones, each over cls and its
+    superclasses. ``expects`` names the bounds the axioms must supply; a missing
+    one is an error rather than an unbounded shape.
+    """
     min_count = max_count = value_class = None
-    found = False
     for on_property, r in restrictions_on(graph, cls):
         if on_property != prop:
             continue
-        found = True
         some = graph.value(r, OWL.someValuesFrom)
         exact = graph.value(r, OWL.qualifiedCardinality)
         at_least = graph.value(r, OWL.minQualifiedCardinality)
@@ -148,9 +163,43 @@ def constraint_from_axioms(graph, cls, prop):
         if upper is not None:
             max_count = upper if max_count is None else min(max_count, upper)
         value_class = value_class or some or graph.value(r, OWL.onClass)
-    if not found:
-        raise ValueError(f"{SLICE_PATH.name} has no axiom on {cls} for {prop}")
+    for bound, value in (("min", min_count), ("max", max_count)):
+        if bound in expects and value is None:
+            raise ValueError(
+                f"{SLICE_PATH.name} has no axiom giving a {bound} cardinality "
+                f"on {cls} for {prop}"
+            )
     return min_count, max_count, value_class
+
+
+def registration_status_shape(slice_graph):
+    """Allow only the slice's RegistrationStatus individuals as status values.
+
+    Records are validated merged with the slice, so sh:class alone would accept
+    a status individual the record declares itself. SHACLGenerator writes sh:in
+    values as literals, so this shape lists the IRIs by hand.
+    """
+    statuses = sorted(
+        str(s)
+        for s in slice_graph.subjects(RDF.type, BREG.RegistrationStatus)
+        if isinstance(s, URIRef)
+    )
+    if not statuses:
+        raise ValueError(
+            f"{SLICE_PATH.name} declares no {BREG.RegistrationStatus} individuals"
+        )
+    values = " ".join(f"<{s}>" for s in statuses)
+    return f"""
+<https://example.org/fibo-lei/shapes/RegistrationStatusValueShape>
+    a sh:NodeShape ;
+    sh:targetClass <{BREG.LegalEntityIdentifierRegistryEntry}> ;
+    sh:property [
+        sh:path <{BREG.hasRegistrationStatus}> ;
+        sh:in ( {values} ) ;
+        sh:message "status must be a RegistrationStatus individual of the FIBO slice" ;
+        sh:severity sh:Violation
+    ] .
+"""
 
 
 def derive_shapes(slice_graph, ontology):
@@ -164,9 +213,9 @@ def derive_shapes(slice_graph, ontology):
         return index[str(term)]
 
     rows = []
-    for cls, prop in FROM_AXIOMS:
+    for cls, prop, expects in FROM_AXIOMS:
         min_count, max_count, value_class = constraint_from_axioms(
-            slice_graph, cls, prop
+            slice_graph, cls, prop, expects
         )
         extra = {"range": str(value_class)} if value_class is not None else {}
         rows.append((cls, prop, min_count, max_count, extra))
@@ -203,7 +252,11 @@ def derive_shapes(slice_graph, ontology):
     shapes = generator.generate(
         {"classes": list(shape_classes.values()), "properties": shape_properties}
     )
-    return generator.serialize(shapes, format="turtle") + REGISTRY_ENTRY_SHAPE
+    return (
+        generator.serialize(shapes, format="turtle")
+        + REGISTRY_ENTRY_SHAPE
+        + registration_status_shape(slice_graph)
+    )
 
 
 def count_property_shapes(shapes):
@@ -212,13 +265,27 @@ def count_property_shapes(shapes):
     return len(list(graph.objects(None, SH.property)))
 
 
+def missing_types(record):
+    """Return a message for each REQUIRED_TYPES class with no instance in the record."""
+    return [
+        f"no {local_name(cls)} in record"
+        for cls in REQUIRED_TYPES
+        if next(record.subjects(RDF.type, cls), None) is None
+    ]
+
+
 def check_record(slice_graph, shapes, record):
-    """Validate one record graph (merged with the slice) and return the report."""
+    """Validate one record graph (merged with the slice).
+
+    Returns (name, report, missing), where missing lists the REQUIRED_TYPES the
+    record has no instance of. A record conforms only if report.conforms and
+    missing is empty.
+    """
     name = next(record.objects(None, REL.hasLegalName), "(no legal name)")
     data = record + slice_graph  # class hierarchy and status individuals for sh:class
     report = run_shacl_validation(data.serialize(format="turtle"), shapes)
     report.explain_violations()
-    return name, report
+    return name, report, missing_types(record)
 
 
 def main(argv=None):
@@ -254,12 +321,14 @@ def main(argv=None):
             reason = " ".join(str(exc).split())
             print(f"FAIL  {path.stem}  parse error: {reason}")
             continue
-        name, report = check_record(slice_graph, shapes, record)
-        if report.conforms:
+        name, report, missing = check_record(slice_graph, shapes, record)
+        if report.conforms and not missing:
             print(f"PASS  {path.stem}  {name}")
             continue
         failed += 1
         print(f"FAIL  {path.stem}  {name}")
+        for message in missing:
+            print(f"      - {message}")
         for violation in report.violations:
             # Inverse paths have no IRI to name, so print the shape's message.
             named = (violation.result_path or "").startswith("http")

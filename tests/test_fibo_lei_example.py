@@ -1,5 +1,6 @@
 """Tests for examples/fibo-lei: passes as shipped, fails on a changed value."""
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -70,6 +71,20 @@ def test_shipped_records_conform():
             "a ex:SomethingElse ;",
             "LEI must be in exactly one LEI registry entry",
         ),
+        # Without its LEIRegisteredEntity type the entity is no focus node for
+        # the legal-name shape, so the record itself must be rejected
+        (
+            "a fibo-be-le-lei:LEIRegisteredEntity, cmns-org:LegalEntity ;",
+            "a cmns-org:LegalEntity ;",
+            "no LEIRegisteredEntity in record",
+        ),
+        # A status the record declares itself is not a FIBO status individual
+        (
+            "fibo-fbc-fct-breg:hasRegistrationStatus fibo-fbc-fct-breg:IssuedStatus .",
+            "fibo-fbc-fct-breg:hasRegistrationStatus ex:MadeUpStatus .\n"
+            "ex:MadeUpStatus a fibo-fbc-fct-breg:RegistrationStatus .",
+            "BusinessRegistries/hasRegistrationStatus> which is not in the allowed set",
+        ),
     ],
     ids=[
         "lei-format",
@@ -77,6 +92,8 @@ def test_shipped_records_conform():
         "jurisdiction",
         "registration-status",
         "registry-entry",
+        "entity-type",
+        "invented-status",
     ],
 )
 def test_changed_constrained_value_fails(tmp_path, old, new, expected):
@@ -114,3 +131,34 @@ def test_one_bad_record_fails_the_whole_run(tmp_path):
     assert result.returncode == 1, result.stdout + result.stderr
     assert result.stdout.count("PASS") == len(good)
     assert result.stdout.count("FAIL") == 1
+
+
+def test_empty_record_fails(tmp_path):
+    empty = tmp_path / "empty.ttl"
+    empty.write_text("", encoding="utf-8")
+
+    result = run_sample(empty)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAIL  empty" in result.stdout
+    assert "no LegalEntityIdentifier in record" in result.stdout
+    assert "no LEIRegisteredEntity in record" in result.stdout
+
+
+def test_missing_status_axiom_stops_derivation():
+    spec = importlib.util.spec_from_file_location("fibo_lei_run", RUN)
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    graph = run.rdflib.Graph().parse(run.SLICE_PATH, format="turtle")
+    entry = run.BREG.LegalEntityIdentifierRegistryEntry
+    prop = run.BREG.hasRegistrationStatus
+    bounds = run.constraint_from_axioms(graph, entry, prop, {"min", "max"})
+    assert bounds[:2] == (1, 1)
+
+    # Drop the entry's own someValuesFrom axiom; the inherited max 1 remains.
+    for r in list(graph.objects(entry, run.RDFS.subClassOf)):
+        if graph.value(r, run.OWL.onProperty) == prop:
+            graph.remove((entry, run.RDFS.subClassOf, r))
+
+    with pytest.raises(ValueError, match="no axiom giving a min cardinality"):
+        run.constraint_from_axioms(graph, entry, prop, {"min", "max"})
