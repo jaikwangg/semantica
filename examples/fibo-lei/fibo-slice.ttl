@@ -8,6 +8,8 @@
 # (its owl:versionIRI).
 #
 # Copyright notices carried by the source ontologies:
+#   FIBO repository LICENSE at the pinned tag:
+#     Copyright (c) 2020 Enterprise Data Management Council
 #   FIBO (LEIEntities, LegalPersons, Relations, BusinessRegistries):
 #     Copyright (c) 2013-2026 EDM Council, Inc. (EDM Association dba EDM Council, Inc.)
 #     Copyright (c) 2013-2025 Object Management Group, Inc.
@@ -253,4 +255,3 @@ fibo-fbc-fct-breg:RegistrationStatus a owl:Class ;
     rdfs:label "registration status" ;
     rdfs:subClassOf <https://spec.edmcouncil.org/fibo/ontology/FND/Arrangements/Lifecycles/LifecycleStage> ;
     skos:definition "lifecycle stage indicating the status of a given registration of something, such as a business or legal entity, as specified by the registration authority" .
-

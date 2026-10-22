@@ -23,7 +23,7 @@ python examples/fibo-lei/run.py
 
 ```text
 FIBO slice: FIBO master_2026Q2 (9 classes, 8 properties)
-Shapes derived: 9 property shapes
+Shapes derived: 10 property shapes
 PASS  1595HU08XQEECLKNGF93  C & V Works ApS
 PASS  506700GE1G29325QX363  Global Legal Entity Identifier Foundation
 PASS  HB7FFAZI0OMZ8PP8OE26  SOCIETY FOR WORLDWIDE INTERBANK FINANCIAL TELECOMMUNICATION
@@ -83,19 +83,44 @@ state them as OWL axioms.
 | Jurisdiction code | the jurisdiction's `hasTag` is one string matching `^[A-Z]{2}(-[A-Z0-9]{1,3})?$` | GLEIF LEI-CDF (`LegalJurisdiction` is an ISO 3166-1 or ISO 3166-2 code) |
 | Registration status | `fibo-fbc-fct-breg:hasRegistrationStatus` exactly 1 `RegistrationStatus` | FIBO `LegalEntityIdentifierRegistryEntry` (some) and `BusinessRegistryEntry` (max 1) axioms |
 | Registry entry holds the LEI | `cmns-col:comprises` at least 1 `LegalEntityIdentifier` | FIBO `LegalEntityIdentifierRegistryEntry` axiom |
+| Every LEI has a registry entry | each `LegalEntityIdentifier` is comprised by exactly 1 `LegalEntityIdentifierRegistryEntry` (inverse path) | GLEIF LEI-CDF (every LEI record has one `Registration`, and `RegistrationStatus` is mandatory) |
+
+The last shape is written by hand in `run.py` (`REGISTRY_ENTRY_SHAPE`), because
+`SHACLGenerator` does not produce inverse paths. Without it, a record whose registry
+entry was removed or retyped would pass, since the status shape only targets
+registry entries.
 
 Each record is validated together with the slice, so `sh:class` sees the FIBO class
 hierarchy (an `LEIRegisteredEntity` is a `cmns-org:LegalPerson`) and the eleven
 registration statuses FIBO defines (`IssuedStatus`, `LapsedStatus`, and so on).
 
+Each record types its entity as both `fibo-be-le-lei:LEIRegisteredEntity` and
+`cmns-org:LegalEntity`. FIBO makes `LEIRegisteredEntity` a subclass of
+`cmns-org:LegalPerson` only, because GLEIF also issues LEIs to parties that are not
+legal entities in that sense (sole traders, for example). The jurisdiction axiom is
+stated on `cmns-org:LegalEntity`, so the jurisdiction checks apply only to records
+typed that way. All five records here are organizations formed under a
+jurisdiction, so they carry the type. A record without it is not checked for
+jurisdiction at all.
+
 Limits worth knowing:
 
 - SHACL reads the OWL restrictions closed-world: a `someValuesFrom` that OWL would
   leave open is required to be present in the record.
+- The shapes are also stricter than the OWL in two ways. A `someValuesFrom` becomes
+  `sh:class` on every value of the property, and a qualified cardinality
+  (`max 1 RegistrationStatus`) becomes an unqualified `sh:maxCount`. So a second,
+  non-LEI identifier on `cmns-id:isIdentifiedBy` (a BIC, say) would fail, although
+  FIBO allows it. That is fine for these records, which carry only the LEI;
+  `sh:qualifiedValueShape` would be the faithful reading if you add other
+  identifiers.
 - The LEI pattern checks the shape of the code, not its ISO 7064 MOD 97-10 check
   digits.
 - Only the four LEI fields below are modelled. Addresses, legal form, entity status,
   and Level 2 relationship data are not.
+- GLEIF gives the legal name a language (`de` for BIS, `fr` for SWIFT). The records
+  drop it and store the name as a plain string, which is what the `xsd:string`
+  shape expects.
 
 ## Pinned FIBO version
 
@@ -150,6 +175,9 @@ valid FIBO registration status and so passes.
   [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/), per the
   [GLEIF LEI Data Terms of Use](https://www.gleif.org/en/meta/lei-data-terms-of-use).
   The Turtle conversion was made for this example; it is not provided, endorsed, or
-  supported by GLEIF.
+  supported by GLEIF. The [CC0 1.0 deed](https://creativecommons.org/publicdomain/zero/1.0/)
+  asks that uses of the work not imply endorsement by the author or affirmer, and
+  section IV(c) of the GLEIF terms asks the same for anything beyond the original
+  LEI data.
 - `run.py` and this README are part of Semantica and fall under the repository's
   license.

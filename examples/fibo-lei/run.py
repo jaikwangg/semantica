@@ -52,6 +52,7 @@ CMNS_DSG = rdflib.Namespace("https://www.omg.org/spec/Commons/Designators/")
 CMNS_COL = rdflib.Namespace("https://www.omg.org/spec/Commons/Collections/")
 CMNS_ORG = rdflib.Namespace("https://www.omg.org/spec/Commons/Organizations/")
 CMNS_RGA = rdflib.Namespace("https://www.omg.org/spec/Commons/RegulatoryAgencies/")
+SH = rdflib.Namespace("http://www.w3.org/ns/shacl#")
 
 # Shapes whose cardinality and sh:class are read from an OWL restriction in the
 # slice. The comment names the axiom; derive_shapes() fails if it is missing.
@@ -81,6 +82,24 @@ FROM_STANDARDS = [
     (LEI.LegalEntityIdentifier, REL.hasTag, 1, 1, {"pattern": LEI_PATTERN}),
     (CMNS_RGA.Jurisdiction, REL.hasTag, 1, 1, {"pattern": JURISDICTION_PATTERN}),
 ]
+
+# LEI-CDF: every LEI record carries exactly one Registration block, which is
+# where registration.status lives. In FIBO that is the registry entry that
+# comprises the LEI, so the path runs backwards along cmns-col:comprises.
+# SHACLGenerator has no inverse paths, so this one shape is written by hand.
+REGISTRY_ENTRY_SHAPE = f"""
+<https://example.org/fibo-lei/shapes/LegalEntityIdentifierRegistrationShape>
+    a sh:NodeShape ;
+    sh:targetClass <{LEI.LegalEntityIdentifier}> ;
+    sh:property [
+        sh:path [ sh:inversePath <{CMNS_COL.comprises}> ] ;
+        sh:class <{BREG.LegalEntityIdentifierRegistryEntry}> ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:message "LEI must be in exactly one LEI registry entry (LEI-CDF)" ;
+        sh:severity sh:Violation
+    ] .
+"""
 
 
 def local_name(iri):
@@ -184,12 +203,17 @@ def derive_shapes(slice_graph, ontology):
     shapes = generator.generate(
         {"classes": list(shape_classes.values()), "properties": shape_properties}
     )
-    return generator.serialize(shapes, format="turtle")
+    return generator.serialize(shapes, format="turtle") + REGISTRY_ENTRY_SHAPE
 
 
-def check_record(slice_graph, shapes, path):
-    """Validate one record file (merged with the slice) and return the report."""
-    record = rdflib.Graph().parse(path, format="turtle")
+def count_property_shapes(shapes):
+    """Count sh:property links in the serialized shapes graph."""
+    graph = rdflib.Graph().parse(data=shapes, format="turtle")
+    return len(list(graph.objects(None, SH.property)))
+
+
+def check_record(slice_graph, shapes, record):
+    """Validate one record graph (merged with the slice) and return the report."""
     name = next(record.objects(None, REL.hasLegalName), "(no legal name)")
     data = record + slice_graph  # class hierarchy and status individuals for sh:class
     report = run_shacl_validation(data.serialize(format="turtle"), shapes)
@@ -217,20 +241,29 @@ def main(argv=None):
         f"FIBO slice: {ontology['version']} "
         f"({classes} classes, {properties} properties)"
     )
-    print(f"Shapes derived: {shapes.count('sh:property [')} property shapes")
+    print(f"Shapes derived: {count_property_shapes(shapes)} property shapes")
     if args.show_shapes:
         print(shapes)
 
     failed = 0
     for path in record_paths:
-        name, report = check_record(slice_graph, shapes, path)
+        try:
+            record = rdflib.Graph().parse(path, format="turtle")
+        except Exception as exc:  # unreadable file or invalid Turtle
+            failed += 1
+            reason = " ".join(str(exc).split())
+            print(f"FAIL  {path.stem}  parse error: {reason}")
+            continue
+        name, report = check_record(slice_graph, shapes, record)
         if report.conforms:
             print(f"PASS  {path.stem}  {name}")
             continue
         failed += 1
         print(f"FAIL  {path.stem}  {name}")
         for violation in report.violations:
-            print(f"      - {violation.explanation}")
+            # Inverse paths have no IRI to name, so print the shape's message.
+            named = (violation.result_path or "").startswith("http")
+            print(f"      - {violation.explanation if named else violation.message}")
 
     print(f"{len(record_paths) - failed}/{len(record_paths)} records conform")
     return 1 if failed else 0

@@ -36,21 +36,50 @@ def test_shipped_records_conform():
 
 
 @pytest.mark.parametrize(
-    "old, new",
+    "old, new, expected",
     [
         # LEI format (ISO 17442): drop a check digit
-        ('hasTag "HWUPKR0MPOU8FGXBT394"', 'hasTag "HWUPKR0MPOU8FGXBT39"'),
+        (
+            'hasTag "HWUPKR0MPOU8FGXBT394"',
+            'hasTag "HWUPKR0MPOU8FGXBT39"',
+            "Relations/hasTag> which does not match the required pattern",
+        ),
         # Legal name is mandatory
-        ('fibo-fnd-rel-rel:hasLegalName "Apple Inc." ;', ""),
+        (
+            'fibo-fnd-rel-rel:hasLegalName "Apple Inc." ;',
+            "",
+            "missing required property <https://spec.edmcouncil.org/fibo/ontology/"
+            "FND/Relations/Relations/hasLegalName>",
+        ),
         # Jurisdiction must be an ISO 3166 code
-        ('hasTag "US-CA"', 'hasTag "California"'),
+        (
+            'hasTag "US-CA"',
+            'hasTag "California"',
+            "jurisdiction-US-CA> has value 'California'",
+        ),
         # Registration status must be a FIBO RegistrationStatus (ActiveStatus is
         # an entity status, not a registration status)
-        ("fibo-fbc-fct-breg:IssuedStatus", "fibo-fbc-fct-breg:ActiveStatus"),
+        (
+            "fibo-fbc-fct-breg:IssuedStatus",
+            "fibo-fbc-fct-breg:ActiveStatus",
+            "BusinessRegistries/hasRegistrationStatus> but it must be an instance",
+        ),
+        # Every LEI needs its registry entry, where the status lives
+        (
+            "a fibo-fbc-fct-breg:LegalEntityIdentifierRegistryEntry ;",
+            "a ex:SomethingElse ;",
+            "LEI must be in exactly one LEI registry entry",
+        ),
     ],
-    ids=["lei-format", "legal-name", "jurisdiction", "registration-status"],
+    ids=[
+        "lei-format",
+        "legal-name",
+        "jurisdiction",
+        "registration-status",
+        "registry-entry",
+    ],
 )
-def test_changed_constrained_value_fails(tmp_path, old, new):
+def test_changed_constrained_value_fails(tmp_path, old, new, expected):
     text = RECORD.read_text(encoding="utf-8")
     assert old in text
     bad = tmp_path / RECORD.name
@@ -60,6 +89,18 @@ def test_changed_constrained_value_fails(tmp_path, old, new):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"FAIL  {bad.stem}" in result.stdout
+    assert expected in result.stdout
+
+
+def test_invalid_turtle_is_a_one_line_failure(tmp_path):
+    bad = tmp_path / "broken.ttl"
+    bad.write_text("ex:broken a .\n", encoding="utf-8")
+
+    result = run_sample(bad)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAIL  broken  parse error:" in result.stdout
+    assert "Traceback" not in result.stdout + result.stderr
 
 
 def test_one_bad_record_fails_the_whole_run(tmp_path):
