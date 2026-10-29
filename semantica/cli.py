@@ -59,10 +59,15 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
 
-# Supported interpreter range: ``requires-python = ">=3.10,<3.14"`` in
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
-MIN_PYTHON = (3, 10)
+# 3.10 was dropped in 0.8.0: it is past end of life and Pillow 13, which has
+# the security fixes 12.x lacks, needs 3.11 (#2067).
+MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)
 
 
@@ -551,10 +556,7 @@ def _show_startup(cli_ctx: CLIContext) -> None:
         return
     cfg = cli_ctx.config.to_dict()
     graph_store = _resolve_graph_backend(cli_ctx)
-    vector_store = (
-        cli_ctx.vector_store_backend
-        or cfg.get("vector_store", {}).get("backend", "faiss")
-    )
+    vector_store = _configured_vector_backend(cli_ctx) or _DEFAULT_VECTOR_BACKEND
     profile = cfg.get("profile", "default")
 
     console.print()
@@ -656,8 +658,9 @@ def main(
         # Reinitialize the module-level console if --no-color was requested so
         # all subsequent console.print() calls in this invocation respect the flag.
         if no_color:
-            global console  # noqa: PLW0603
+            global console, err_console  # noqa: PLW0603
             console = Console(no_color=True)
+            err_console = Console(stderr=True, no_color=True)
         ctx.obj = CLIContext(
             config_path=_resolve_config_path(config_path),
             config=config,
@@ -821,6 +824,42 @@ def shell(ctx: click.Context) -> None:
             _warn(cli_ctx, f"Error: {exc}")
 
 
+def _plain_release(version: str) -> Optional[Tuple[int, ...]]:
+    """Parse a plain X.Y.Z release into a comparable tuple, or None.
+
+    Trailing zero components are dropped so 0.8 and 0.8.0 compare equal.
+    """
+    if not re.fullmatch(r"\d+(\.\d+)*", version):
+        return None
+    parts = [int(p) for p in version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _compare_versions(a: str, b: str) -> Optional[int]:
+    """Compare two version strings: 1 if a > b, 0 if equal, -1 if a < b.
+
+    Uses PEP 440 ordering when packaging is installed. It is not a core
+    dependency (#1513), so without it only plain X.Y.Z releases are ordered.
+    Returns None when no ordering can be established (e.g. a missing release
+    tag), so callers never guess an update from string equality.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        ra, rb = _plain_release(a), _plain_release(b)
+        if ra is None or rb is None:
+            return 0 if a == b else None
+        return (ra > rb) - (ra < rb)
+
+    try:
+        va, vb = Version(a), Version(b)
+    except InvalidVersion:
+        return None
+    return (va > vb) - (va < vb)
+
+
 @main.command()
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -844,20 +883,36 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
         tag: str = data.get("tag_name", "unknown")
         body: str = data.get("body", "").strip()
         html_url: str = data.get("html_url", "")
-        latest = tag.lstrip("v")
+        latest = tag.removeprefix("v")
         current = __version__
+        order = _compare_versions(latest, current)
+        update_available = None if order is None else order > 0
 
         if _is_json(cli_ctx, local_json):
-            _jecho({"current": current, "latest": latest, "url": html_url, "notes": body})
+            _jecho({
+                "current": current,
+                "latest": latest,
+                "update_available": update_available,
+                "url": html_url,
+                "notes": body,
+            })
             return
 
-        up_to_date = latest == current
-        status = (
-            f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
-            if up_to_date
-            else f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
-                 f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
-        )
+        if order is None:
+            status = f"[{_DIM}]Could not compare {current} with release {tag}[/{_DIM}]"
+        elif order > 0:
+            status = (
+                f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
+                f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
+            )
+        elif order == 0:
+            status = f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
+        else:
+            # A dev or unreleased build sorts above the latest published release.
+            status = (
+                f"[{_SUCCESS}]You are ahead of the latest release "
+                f"({current} > {latest})[/{_SUCCESS}]"
+            )
         console.print(
             Panel(
                 Text.from_markup(
@@ -870,7 +925,7 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
                 padding=(1, 2),
             )
         )
-        if html_url and not up_to_date:
+        if html_url and update_available:
             console.print(f"  [{_DIM}]Full notes: {html_url}[/{_DIM}]")
 
     _run_with_error_handling(_action)
@@ -947,14 +1002,73 @@ def doctor(cli_ctx: CLIContext, local_json: bool, deep_embeddings: bool) -> None
             return f"{backend} reachable"
         checks.append(_check("Graph store", _graph, hint="run 'semantica store list' to see configured backends"))
 
-        # Vector store
+        # Vector store: the one CLI commands build (--vector-store or
+        # vector_store.backend). The MCP server's own store is checked below.
+        configured_vector = _configured_vector_backend(cli_ctx)
+        mcp_configured = _mcp_stores_configured()
+
         def _vector() -> str:
-            cfg = cli_ctx.config.to_dict()
-            backend = cli_ctx.vector_store_backend or cfg.get("vector_store", {}).get("backend", "faiss")
+            backend = configured_vector or _DEFAULT_VECTOR_BACKEND
             if backend == "faiss":
                 import faiss  # noqa: F401
+            elif backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
             return f"{backend} importable"
-        checks.append(_check("Vector store", _vector, hint="pip install semantica[vectorstore-…]"))
+        vector_row = _check(
+            "Vector store", _vector, hint="pip install semantica[vectorstore-…]"
+        )
+        if vector_row[1] == "fail" and not configured_vector and mcp_configured:
+            # Nothing asked the CLI for faiss and this deployment configures
+            # the MCP server instead, so the missing default is not an error
+            # for it — only for CLI vector commands (#1818).
+            vector_row = (
+                "Vector store", "warn", f"{vector_row[2]} (CLI default)",
+                "set vector_store.backend to use CLI vector commands",
+            )
+        checks.append(vector_row)
+
+        # MCP server stores (#1818): configured only through the environment
+        # and resolved by the server's own session helpers, so this reports
+        # exactly what `semantica mcp` would build.
+        def _mcp_vector() -> str:
+            from semantica_mcp.mcp.session import resolve_vector_backend
+
+            backend, _ = resolve_vector_backend()
+            if backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
+            return backend
+
+        def _mcp_graph() -> str:
+            from semantica_mcp.mcp.session import kg_file_to_load, kg_path
+            from .context import ContextGraph
+
+            if not kg_path():
+                return "in-memory, not persisted (SEMANTICA_KG_PATH unset)"
+            path = kg_file_to_load()
+            if path is None:
+                return "new graph, created on first save"
+            graph = ContextGraph()
+            try:
+                graph.load_from_file(path)
+            except Exception as exc:
+                # The server would start empty and refuse to save over it.
+                raise RuntimeError(
+                    f"cannot load {path}: {exc}; persistence would be disabled"
+                ) from exc
+            return f"{len(graph.get_nodes_by_label('decision'))} decision(s)"
+
+        if mcp_configured:
+            checks.append(_check(
+                "MCP vector store", _mcp_vector,
+                hint="check SEMANTICA_VECTOR_*; sqlite needs "
+                     "pip install 'semantica[vectorstore-sqlite]'",
+            ))
+            checks.append(_check(
+                "MCP graph", _mcp_graph,
+                hint="fix or move the file at SEMANTICA_KG_PATH",
+            ))
 
         # Embedding backends (#994): `doctor` used to report all green while
         # every local embedding backend was non-functional — import success
@@ -1267,6 +1381,19 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 # `semantica init` offers memory as its default and ContextGraph serves it
 # without any server, so it is also the fallback when nothing is configured.
 _DEFAULT_GRAPH_BACKEND = MEMORY_GRAPH_BACKEND
+# VectorStore's own default: what CLI vector commands build when neither
+# --vector-store nor vector_store.backend is set.
+_DEFAULT_VECTOR_BACKEND = "faiss"
+# Environment that configures the MCP server's stores
+# (semantica_mcp/mcp/session.py). It never changes what the CLI builds, so
+# ``doctor`` reports it in rows of its own rather than folding it into the
+# CLI's vector and graph checks (#1818).
+_MCP_STORE_ENV_VARS = (
+    "SEMANTICA_VECTOR_BACKEND",
+    "SEMANTICA_VECTOR_DB_PATH",
+    "SEMANTICA_VECTOR_PATH",
+    "SEMANTICA_KG_PATH",
+)
 
 
 def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
@@ -1280,6 +1407,33 @@ def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
     return cli_ctx.store_backend or graph_db.get(
         "backend", _DEFAULT_GRAPH_BACKEND
     )
+
+
+def _configured_vector_backend(cli_ctx: CLIContext) -> Optional[str]:
+    """The ``--vector-store`` flag or ``vector_store.backend``; None if unset."""
+    return cli_ctx.vector_store_backend or cli_ctx.config.to_dict().get(
+        "vector_store", {}
+    ).get("backend")
+
+
+def _mcp_stores_configured() -> bool:
+    """True when the environment configures the MCP server's stores."""
+    return any(os.environ.get(var, "").strip() for var in _MCP_STORE_ENV_VARS)
+
+
+def _probe_sqlite_vec() -> None:
+    """Raise unless the sqlite-vec extension actually loads.
+
+    ``SQLITE_VEC_AVAILABLE`` is a ``find_spec`` probe: it proves the package is
+    discoverable, not that the native extension loads. Building a throwaway
+    in-memory store runs the store's real load path, so a broken install fails
+    here rather than on first use.
+    """
+    from .vector_store.sqlite_vec_store import SQLITE_VEC_AVAILABLE, SQLiteVecStore
+
+    if not SQLITE_VEC_AVAILABLE:
+        raise ImportError("sqlite-vec is not installed")
+    SQLiteVecStore(db_path=":memory:", table_name="doctor_probe", dimension=1).close()
 
 
 def _uses_memory_graph(cli_ctx: CLIContext) -> bool:
@@ -1757,7 +1911,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -5477,9 +5634,9 @@ def _collect_backup_sources(
 ) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
     """Return (arcname, local_path) pairs for local files to include in a backup.
 
-    Also returns each configured store whose local path does not exist, so the
-    caller can report it instead of writing a partial archive with no sign that
-    a store was dropped (#2009).
+    Also returns each configured store whose local path does not exist or holds
+    no files, so the caller can report it instead of writing a partial archive
+    with no sign that a store was dropped (#2009, #2014).
     """
     sources: List[Tuple[str, Path]] = []
     skipped: List[Dict[str, str]] = []
@@ -5498,11 +5655,26 @@ def _collect_backup_sources(
         if ont_path:
             p = Path(ont_path)
             if p.is_dir():
+                before = len(sources)
                 for f in p.rglob("*"):
                     if f.is_file():
                         sources.append((f"ontology/{f.relative_to(p)}", f))
+                if len(sources) == before:
+                    # An existing-but-empty directory contributed nothing; report
+                    # it instead of dropping it silently (#2014).
+                    skipped.append({
+                        "store": "ontology",
+                        "backend": "file",
+                        "path": _redact(ont_path),
+                    })
             elif p.is_file():
                 sources.append((f"ontology/{p.name}", p))
+            else:
+                skipped.append({
+                    "store": "ontology",
+                    "backend": "file",
+                    "path": _redact(ont_path),
+                })
 
     store_map = {"graph": "graph_db", "vector": "vector_store", "triplet": "triplet_store"}
     for store_type, cfg_key in store_map.items():
@@ -5520,9 +5692,19 @@ def _collect_backup_sources(
             continue
         p = Path(data_path)
         if p.is_dir():
+            before = len(sources)
             for f in p.rglob("*"):
                 if f.is_file():
                     sources.append((f"{store_type}/{f.relative_to(p)}", f))
+            if len(sources) == before:
+                # Same reporting rule as a missing path: an empty directory
+                # yields no files, so the store would vanish from the archive
+                # with no sign of it (#2014).
+                skipped.append({
+                    "store": store_type,
+                    "backend": str(info.get("backend", "unknown")),
+                    "path": _redact(data_path),
+                })
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
         else:
@@ -5535,6 +5717,54 @@ def _collect_backup_sources(
             })
 
     return sources, skipped
+
+
+def _skip_label(store: str) -> str:
+    """Human label for a skipped entry, without calling ontology a 'store'."""
+    return "ontology" if store == "ontology" else f"{store} store"
+
+
+def _warn_skipped(cli_ctx: CLIContext, skipped: List[Dict[str, str]]) -> None:
+    """Name every configured path that contributed no files (#2009, #2014)."""
+    for entry in skipped:
+        _warn(
+            cli_ctx,
+            f"Skipping {_skip_label(entry['store'])} ({entry['backend']}): "
+            f"path does not exist or contains no files: {entry['path']}",
+        )
+
+
+def _raise_on_no_store_data(sources: List[Tuple[str, Path]], include: str) -> None:
+    """Refuse a backup that would hold no store data at all (#1820).
+
+    Called by the real command and by its dry run alike: a preview that
+    reports success for an archive the real command refuses to write is the
+    same surprise as a successful backup with nothing in it (#2122).
+    """
+    if include not in ("graph", "vector", "triplet", "all"):
+        return
+    if any(arcname.startswith(("graph/", "vector/", "triplet/"))
+           for arcname, _ in sources):
+        return
+    stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
+    raise click.ClickException(
+        f"No store data to back up: found no local files for the {stores}. "
+        "backup create only copies file-based stores (a graph_db / vector_store / "
+        "triplet_store path that exists on disk); run `semantica backup info` "
+        "to see how to back up other backends."
+    )
+
+
+def _raise_on_skipped(skipped: List[Dict[str, str]], *, target: str) -> None:
+    """Raise the --fail-on-skip error naming every skipped path."""
+    if not skipped:
+        return
+    missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
+    raise click.ClickException(
+        f"Configured store path does not exist or contains no files: {missing}. "
+        f"Nothing from those stores would be {target}; create the path, drop it "
+        "from the config, or omit --fail-on-skip to continue with the rest."
+    )
 
 
 def _redact(uri: str) -> str:
@@ -5603,7 +5833,7 @@ def backup_info(cli_ctx: CLIContext, local_json: bool) -> None:
 @click.option("--strip-config", is_flag=True, default=False,
               help="Exclude semantica.yaml to avoid storing credentials at rest.")
 @click.option("--fail-on-skip", is_flag=True, default=False,
-              help="Exit non-zero when a configured store path does not exist.")
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
@@ -5623,7 +5853,24 @@ def backup_create(
 
     def _action() -> None:
         if _is_dry(cli_ctx, local_dry):
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            # A dry run is a preview of the real command, so it has to report
+            # the same skipped stores, honour --fail-on-skip and refuse an
+            # archive the real run would not write (#2109, #2122).
+            cfg = cli_ctx.config.to_dict()
+            sources, skipped = _collect_backup_sources(
+                cfg, cli_ctx.config_path, include, strip_config,
+            )
+            _warn_skipped(cli_ctx, skipped)
+            _raise_on_no_store_data(sources, include)
+            if fail_on_skip:
+                _raise_on_skipped(skipped, target="in the archive")
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -5656,34 +5903,14 @@ def backup_create(
         # so a partial archive was reported as a success (#2009). Report every
         # one before the prompts, and before the empty-archive check below so
         # the missing paths are named even when no store is left to back up.
-        for entry in skipped:
-            _warn(
-                cli_ctx,
-                f"Skipping {entry['store']} store ({entry['backend']}): "
-                f"path does not exist: {entry['path']}",
-            )
+        _warn_skipped(cli_ctx, skipped)
 
         # Fail before any prompt instead of writing an archive with no
         # store data in it (#1820).
-        if include in ("graph", "vector", "triplet", "all") and not any(
-            arcname.startswith(("graph/", "vector/", "triplet/"))
-            for arcname, _ in sources
-        ):
-            stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
-            raise click.ClickException(
-                f"No store data to back up: found no local files for the {stores}. "
-                "backup create only copies file-based stores (a graph_db / vector_store / "
-                "triplet_store path that exists on disk); run `semantica backup info` "
-                "to see how to back up other backends."
-            )
+        _raise_on_no_store_data(sources, include)
 
-        if skipped and fail_on_skip:
-            missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
-            raise click.ClickException(
-                f"Configured store path does not exist: {missing}. Nothing from "
-                "those stores would be in the archive; create the path, drop it "
-                "from the config, or omit --fail-on-skip to back up the rest."
-            )
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="in the archive")
 
         if encrypt and passphrase is None:
             passphrase = click.prompt("Backup passphrase", hide_input=True,
@@ -5775,11 +6002,13 @@ def backup_create(
 @click.option("--include",
               type=click.Choice(["graph", "vector", "triplet", "config", "ontology", "all"]),
               default="all", show_default=True)
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
-                local_dry: bool, local_quiet: bool) -> None:
+                fail_on_skip: bool, local_dry: bool, local_quiet: bool) -> None:
     """Incremental folder sync (idempotent, copies only changed files).
 
     \b
@@ -5793,12 +6022,17 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
         import shutil
         dest = Path(destination)
         cfg = cli_ctx.config.to_dict()
-        sources, _skipped = _collect_backup_sources(
+        sources, skipped = _collect_backup_sources(
             cfg, cli_ctx.config_path, include, strip_config=False,
         )
+        # A skipped store used to be discarded here, so a sync after a partial
+        # create reported success for an incomplete store set (#2014).
+        _warn_skipped(cli_ctx, skipped)
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:

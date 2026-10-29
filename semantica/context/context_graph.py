@@ -4013,17 +4013,46 @@ class ContextGraph:
         
         Args:
             decision_id: Starting decision ID
-            direction: "upstream" or "downstream"
-            max_depth: Maximum traversal depth
-            
+            direction: "upstream", "downstream" or "both" (the upstream
+                chain followed by the downstream one, each decision listed
+                once and tagged with metadata["causal_direction"])
+            max_depth: Maximum traversal depth, per direction
+
         Returns:
             List of decisions in causal chain
         """
         from .decision_models import Decision
-        
+
+        if direction == "both":
+            chain, seen = [], set()
+            for side in ("upstream", "downstream"):
+                for d in self.get_causal_chain(decision_id, side, max_depth):
+                    if d.decision_id not in seen:
+                        seen.add(d.decision_id)
+                        d.metadata["causal_direction"] = side
+                        chain.append(d)
+            return chain
+
         if direction not in ["upstream", "downstream"]:
-            raise ValueError("Direction must be 'upstream' or 'downstream'")
-        
+            raise ValueError("Direction must be 'upstream', 'downstream' or 'both'")
+
+        # Build the causal adjacency once.  The traversal below used to loop
+        # over ``self.edges`` for every decision it dequeued, which is O(V*E)
+        # on a wide causal graph.  One pass over the edge list is enough, and
+        # keeps the per-node neighbour order identical to the old scan.
+        causal_neighbors: Dict[str, List[str]] = defaultdict(list)
+        for edge in self.edges:
+            edge_type = edge.edge_type
+            if (
+                not isinstance(edge_type, str)
+                or edge_type.upper() not in _CAUSAL_TRAVERSAL_TYPES
+            ):
+                continue
+            if direction == "upstream":
+                causal_neighbors[edge.target_id].append(edge.source_id)
+            else:
+                causal_neighbors[edge.source_id].append(edge.target_id)
+
         # BFS traversal
         visited = set()
         queue = deque([(decision_id, 0)])
@@ -4067,16 +4096,10 @@ class ContextGraph:
                         decision.metadata["causal_distance"] = depth
                         decisions.append(decision)
             
-            # Find connected decisions
-            for edge in self.edges:
-                if direction == "upstream":
-                    if edge.target_id == current_id and edge.edge_type.upper() in _CAUSAL_TRAVERSAL_TYPES:
-                        if edge.source_id not in visited and depth < max_depth:
-                            queue.append((edge.source_id, depth + 1))
-                else:  # downstream
-                    if edge.source_id == current_id and edge.edge_type.upper() in _CAUSAL_TRAVERSAL_TYPES:
-                        if edge.target_id not in visited and depth < max_depth:
-                            queue.append((edge.target_id, depth + 1))
+            # Find connected decisions from the adjacency built once above.
+            for next_id in causal_neighbors.get(current_id, ()):
+                if next_id not in visited and depth < max_depth:
+                    queue.append((next_id, depth + 1))
         
         # Sort by depth for upstream (most distant first) and downstream (closest first)
         if direction == "upstream":
@@ -4414,6 +4437,7 @@ class ContextGraph:
         metadata: Optional[Dict[str, Any]] = None,
         valid_from: Optional[Union[str, int, float, datetime]] = None,
         valid_until: Optional[Union[str, int, float, datetime]] = None,
+        decision_id: Optional[str] = None,
         **kwargs
     ) -> str:
         """
@@ -4428,6 +4452,11 @@ class ContextGraph:
             entities: Related entities
             decision_maker: Who made the decision
             metadata: Additional metadata
+            valid_from: Start of the decision's validity window
+            valid_until: End of the decision's validity window
+            decision_id: Optional pre-generated decision ID. When omitted, a
+                UUID is generated. A caller-supplied ID must not already
+                exist in this graph.
             **kwargs: Additional decision data
             
         Returns:
@@ -4502,7 +4531,15 @@ class ContextGraph:
             if len(str(value)) > 1000:
                 raise ValueError("Additional field values must be 1000 characters or less")
         
-        decision_id = str(uuid.uuid4())
+        if decision_id is not None:
+            if not isinstance(decision_id, str) or not decision_id.strip():
+                raise ValueError("Decision ID must be a non-empty string")
+            if decision_id in self.nodes or decision_id in getattr(
+                self, "_decisions", {}
+            ):
+                raise ValueError(f"Decision ID {decision_id!r} already exists")
+        else:
+            decision_id = str(uuid.uuid4())
         timestamp = datetime.now().timestamp()
         
         # Sanitize inputs
