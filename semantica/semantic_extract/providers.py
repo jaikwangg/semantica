@@ -761,6 +761,9 @@ class OpenAIProvider(BaseProvider):
                 ``instructor`` will use ``Mode.JSON`` instead of
                 ``Mode.TOOLS`` because most OpenAI-compatible servers do not
                 implement the full function-calling protocol.
+            **kwargs: Extra provider config. ``timeout`` (seconds, or an
+                ``httpx.Timeout``) is passed to the OpenAI client; the SDK
+                default of 600s applies when it is not set.
         """
         super().__init__(**kwargs)
         self.api_key = api_key or config.get_api_key("openai")
@@ -790,6 +793,8 @@ class OpenAIProvider(BaseProvider):
                 init_kwargs: Dict[str, Any] = {"api_key": self.api_key}
                 if self.base_url:
                     init_kwargs["base_url"] = self.base_url
+                # Reasoning models can exceed the SDK's 600s default.
+                self._add_if_set(init_kwargs, self.config, "timeout")
                 self.client = OpenAI(**init_kwargs)
         except (ImportError, OSError):
             self.client = None
